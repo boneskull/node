@@ -22,6 +22,11 @@ function cleanup() {
   exit 0
 }
 
+if ! [ -x "$(command -v fetch)" ]; then
+  echo "depot-tools not found; see https://goo.gl/j6TPTv for installation instructions"
+  exit 1
+fi
+
 cd deps
 # stash local changes
 git stash
