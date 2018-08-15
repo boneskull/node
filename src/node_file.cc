@@ -1248,6 +1248,9 @@ int RMDirForceSyncDir(uv_loop_t* loop,
     case UV_ENOTEMPTY:
     case UV_EEXIST:
     case UV_EPERM:
+      // if we're here, then we couldn't rmdir `path`, typically because
+      // it's full of stuff.  We'll push it back on our stack of paths to
+      // contend with later.
       continuation_data->PushPath(std::move(path));
       int scandir_rc = uv_fs_scandir(loop, req, path.c_str(), 0, nullptr);
 
@@ -1255,8 +1258,9 @@ int RMDirForceSyncDir(uv_loop_t* loop,
         return scandir_rc;
       }
 
-      if (scandir_rc == 0 ) {
-        // the directory is now apparently empty
+      // the directory is now apparently empty (maybe it wasn't just a second
+      // ago..)
+      if (scandir_rc == 0) {
         return RMDirForceSyncDir(loop, req, path, continuation_data, rmdir_rc);
       }
 
@@ -1292,8 +1296,8 @@ int RMDirForceSync(uv_loop_t* loop, uv_fs_t* req, const std::string& path,
         // the path doesn't exist.
         break;
       case UV_EPERM:
-        // TODO windows can EPERM on lstat; we could try to
-        // TODO chmod the path into capitulation, as rimraf does.
+        // Windows can EPERM on lstat; we could try to chmod the path into
+        // capitulation, as rimraf does.
       default:
         const uv_stat_t* const s = static_cast<const uv_stat_t*>(req->ptr);
         int is_dir = !!(s->st_mode & S_IFDIR);
@@ -1309,8 +1313,11 @@ int RMDirForceSync(uv_loop_t* loop, uv_fs_t* req, const std::string& path,
               break;
             case UV_EISDIR:
             case UV_EPERM:
-              rmdir_rc = RMDirForceSyncDir(
-                  loop, req, std::move(next_path), &continuation_data, unlink_rc);
+              rmdir_rc = RMDirForceSyncDir(loop,
+                                           req,
+                                           std::move(next_path),
+                                           &continuation_data,
+                                           unlink_rc);
             default:
               return unlink_rc;
           }
