@@ -1234,25 +1234,128 @@ static void Unlink(const FunctionCallbackInfo<Value>& args) {
   }
 }
 
+int RMDirForceSyncDir(uv_loop_t* loop,
+                      uv_fs_t* req,
+                      const std::string& path,
+                      FSContinuationData * continuation_data,
+                      int original_rc) {
+  int rmdir_rc = uv_fs_rmdir(loop, req, path.c_str(), nullptr);
+  switch (rmdir_rc) {
+    case 0:
+      return 0;
+    case UV_ENOTDIR:
+      return original_rc;
+    case UV_ENOTEMPTY:
+    case UV_EEXIST:
+    case UV_EPERM:
+      continuation_data->PushPath(std::move(path));
+      int scandir_rc = uv_fs_scandir(loop, req, path.c_str(), 0, nullptr);
+
+      if (scandir_rc < 0) {
+        return scandir_rc;
+      }
+
+      if (scandir_rc == 0 ) {
+        // the directory is now apparently empty
+        return RMDirForceSyncDir(loop, req, path, continuation_data, rmdir_rc);
+      }
+
+      for (int i = 0; i < scandir_rc; i++) {
+        uv_dirent_t ent;
+        std::string next_path;
+        int scandir_next_rc = uv_fs_scandir_next(req, &ent);
+        switch (scandir_next_rc) {
+          case 0:
+          case UV_EOF:
+            next_path = path + std::string(kPathSeparator) + ent.name;
+            continuation_data->PushPath(std::move(next_path));
+            return 0;
+          default:
+            return scandir_next_rc;
+        }
+      }
+  }
+  return rmdir_rc;
+}
+
+int RMDirForceSync(uv_loop_t* loop, uv_fs_t* req, const std::string& path,
+                   uv_fs_cb cb = nullptr) {
+  FSContinuationData continuation_data(req, cb);
+  continuation_data.PushPath(std::move(path));
+
+  while (continuation_data.paths.size() > 0) {
+    std::string next_path = continuation_data.PopPath();
+    int lstat_rc = uv_fs_lstat(loop, req, next_path.c_str(), nullptr);
+    switch (lstat_rc) {
+      case UV_ENOENT:
+        // since this is a "force" operation, we don't care if
+        // the path doesn't exist.
+        break;
+      case UV_EPERM:
+        // TODO windows can EPERM on lstat; we could try to
+        // TODO chmod the path into capitulation, as rimraf does.
+      default:
+        const uv_stat_t* const s = static_cast<const uv_stat_t*>(req->ptr);
+        int is_dir = !!(s->st_mode & S_IFDIR);
+        int rmdir_rc = 0;
+        if (is_dir == 1) {
+          rmdir_rc = RMDirForceSyncDir(
+              loop, req, std::move(next_path), &continuation_data, lstat_rc);
+        } else {
+          int unlink_rc = uv_fs_unlink(loop, req, next_path.c_str(), nullptr);
+          switch (unlink_rc) {
+            case 0:
+            case UV_ENOENT:
+              break;
+            case UV_EISDIR:
+            case UV_EPERM:
+              rmdir_rc = RMDirForceSyncDir(
+                  loop, req, std::move(next_path), &continuation_data, unlink_rc);
+            default:
+              return unlink_rc;
+          }
+        }
+        if (rmdir_rc != 0) {
+          return rmdir_rc;
+        }
+    }
+  }
+  return 0;
+}
+
+int RMDirForceAsync(uv_loop_t* loop,
+                uv_fs_t* req,
+                const char* path,
+                uv_fs_cb cb) {
+}
+
 static void RMDir(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
   const int argc = args.Length();
-  CHECK_GE(argc, 2);
+  CHECK_GE(argc, 3);
 
   BufferValue path(env->isolate(), args[0]);
   CHECK_NOT_NULL(*path);
 
+  CHECK(args[1]->IsBoolean());
+  bool force = args[1]->IsTrue();
+
   FSReqBase* req_wrap_async = GetReqWrap(env, args[1]);  // rmdir(path, req)
   if (req_wrap_async != nullptr) {
     AsyncCall(env, req_wrap_async, args, "rmdir", UTF8, AfterNoArgs,
-              uv_fs_rmdir, *path);
+              force ? RMDirForceAsync : uv_fs_rmdir, *path);
   } else {  // rmdir(path, undefined, ctx)
-    CHECK_EQ(argc, 3);
+    CHECK_EQ(argc, 4);
     FSReqWrapSync req_wrap_sync;
     FS_SYNC_TRACE_BEGIN(rmdir);
-    SyncCall(env, args[2], &req_wrap_sync, "rmdir",
-             uv_fs_rmdir, *path);
+    if (force) {
+      SyncCall(env, args[2], &req_wrap_sync, "rmdir",
+               RMDirForceSync, *path);
+    } else {
+      SyncCall(env, args[2], &req_wrap_sync, "rmdir",
+               uv_fs_rmdir, *path);
+    }
     FS_SYNC_TRACE_END(rmdir);
   }
 }

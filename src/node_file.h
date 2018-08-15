@@ -27,6 +27,9 @@ class FSContinuationData : public MemoryRetainer {
   FSContinuationData(uv_fs_t* req, int mode, uv_fs_cb done_cb)
       : req(req), mode(mode), done_cb(done_cb) {
   }
+  FSContinuationData(uv_fs_t* req, uv_fs_cb done_cb)
+      : req(req), done_cb(done_cb) {
+  }
 
   uv_fs_t* req;
   int mode;
