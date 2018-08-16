@@ -1291,14 +1291,12 @@ int RMDirForceSync(uv_loop_t* loop, uv_fs_t* req, const std::string& path,
     std::string next_path = continuation_data.PopPath();
     int lstat_rc = uv_fs_lstat(loop, req, next_path.c_str(), nullptr);
     switch (lstat_rc) {
-      case UV_ENOENT:
+      case UV_ENOENT: {
         // since this is a "force" operation, we don't care if
         // the path doesn't exist.
         break;
-      case UV_EPERM:
-        // Windows can EPERM on lstat; we could try to chmod the path into
-        // capitulation, as rimraf does.
-      default:
+      }
+      case 0: {
         const uv_stat_t* const s = static_cast<const uv_stat_t*>(req->ptr);
         int is_dir = !!(s->st_mode & S_IFDIR);
         int rmdir_rc = 0;
@@ -1325,6 +1323,15 @@ int RMDirForceSync(uv_loop_t* loop, uv_fs_t* req, const std::string& path,
         if (rmdir_rc != 0) {
           return rmdir_rc;
         }
+        break;
+      }
+      case UV_EPERM: {
+        // Windows can EPERM on lstat; we could try to chmod the path into
+        // capitulation, as rimraf does.
+      }
+      default: {
+        return lstat_rc;
+      }
     }
   }
   return 0;
@@ -1334,6 +1341,27 @@ int RMDirForceAsync(uv_loop_t* loop,
                 uv_fs_t* req,
                 const char* path,
                 uv_fs_cb cb) {
+  FSReqBase* req_wrap = FSReqBase::from_req(req);
+  // on the first iteration of algorithm, stash state information.
+  if (req_wrap->continuation_data == nullptr) {
+    req_wrap->continuation_data = std::unique_ptr<FSContinuationData>{
+      new FSContinuationData(req, cb)};
+    req_wrap->continuation_data->PushPath(std::move(path));
+  }
+
+  std::string next_path = req_wrap->continuation_data->PopPath();
+  int lstat_rc = uv_fs_lstat(loop, req, next_path.c_str(), uv_fs_callback_t{[](uv_fs_t* req) {
+    FSReqBase* req_wrap = FSReqBase::from_req(req);
+    Environment* env = req_wrap->env();
+    uv_loop_t* loop = env->event_loop();
+    std::string path = req->path;
+    int lstat_rc = req->result;
+
+    switch(lstat_rc) {
+
+    }
+  }});
+
 }
 
 static void RMDir(const FunctionCallbackInfo<Value>& args) {
@@ -1348,11 +1376,13 @@ static void RMDir(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[1]->IsBoolean());
   bool force = args[1]->IsTrue();
 
-  FSReqBase* req_wrap_async = GetReqWrap(env, args[1]);  // rmdir(path, req)
+  FSReqBase* req_wrap_async = GetReqWrap(env, args[1]);
   if (req_wrap_async != nullptr) {
+    // rmdir(path, force, req)
     AsyncCall(env, req_wrap_async, args, "rmdir", UTF8, AfterNoArgs,
               force ? RMDirForceAsync : uv_fs_rmdir, *path);
-  } else {  // rmdir(path, undefined, ctx)
+  } else {
+    // rmdir(path, force, undefined, ctx)
     CHECK_EQ(argc, 4);
     FSReqWrapSync req_wrap_sync;
     FS_SYNC_TRACE_BEGIN(rmdir);
