@@ -34,6 +34,7 @@ class FSContinuationData : public MemoryRetainer {
   uv_fs_t* req;
   int mode;
   std::vector<std::string> paths{};
+  int last_rc;
 
   void PushPath(std::string&& path) {
     paths.emplace_back(std::move(path));

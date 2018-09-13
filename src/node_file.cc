@@ -1237,23 +1237,22 @@ static void Unlink(const FunctionCallbackInfo<Value>& args) {
 int RMDirForceSyncDir(uv_loop_t* loop,
                       uv_fs_t* req,
                       const std::string& path,
-                      FSContinuationData * continuation_data,
-                      int original_rc) {
+                      FSContinuationData * continuation_data) {
   int rmdir_rc = uv_fs_rmdir(loop, req, path.c_str(), nullptr);
+  uv_fs_req_cleanup(req);
   switch (rmdir_rc) {
     case 0:
       return 0;
     case UV_ENOTDIR:
-      return original_rc;
+      return continuation_data->last_rc;
     case UV_ENOTEMPTY:
     case UV_EEXIST:
-    case UV_EPERM:
+    case UV_EPERM: {
       // if we're here, then we couldn't rmdir `path`, typically because
       // it's full of stuff.  We'll push it back on our stack of paths to
       // contend with later.
       continuation_data->PushPath(std::move(path));
       int scandir_rc = uv_fs_scandir(loop, req, path.c_str(), 0, nullptr);
-
       if (scandir_rc < 0) {
         return scandir_rc;
       }
@@ -1261,25 +1260,106 @@ int RMDirForceSyncDir(uv_loop_t* loop,
       // the directory is now apparently empty (maybe it wasn't just a second
       // ago..)
       if (scandir_rc == 0) {
-        return RMDirForceSyncDir(loop, req, path, continuation_data, rmdir_rc);
+        return 0;
       }
 
-      for (int i = 0; i < scandir_rc; i++) {
+      while (true) {
         uv_dirent_t ent;
         std::string next_path;
         int scandir_next_rc = uv_fs_scandir_next(req, &ent);
         switch (scandir_next_rc) {
-          case 0:
           case UV_EOF:
+            uv_fs_req_cleanup(req);
+            return 0;
+          case 0:
             next_path = path + std::string(kPathSeparator) + ent.name;
             continuation_data->PushPath(std::move(next_path));
-            return 0;
+            break;
           default:
+            uv_fs_req_cleanup(req);
             return scandir_next_rc;
         }
       }
+      break;
+    }
+    default:
+      return rmdir_rc;
   }
-  return rmdir_rc;
+}
+
+
+int RMDirForceAsyncDir(uv_loop_t* loop,
+                       uv_fs_t* req,
+                       const std::string& path) {
+  return uv_fs_rmdir(loop,
+                     req,
+                     path.c_str(),
+                     uv_fs_callback_t{[](uv_fs_t* req) {
+    FSReqBase* req_wrap = FSReqBase::from_req(req);
+    uv_loop_t* loop = req->loop;
+    int rmdir_rc = req->result;
+    switch (rmdir_rc) {
+      case 0: {
+        if (req_wrap->continuation_data->paths.size() == 0) {
+          req_wrap->continuation_data->Done(0);
+        } else {
+          uv_fs_req_cleanup(req);
+        }
+        return;
+      }
+      case UV_ENOTDIR: {
+        req_wrap->continuation_data->Done(req_wrap->continuation_data->last_rc);
+        break;
+      }
+      case UV_ENOTEMPTY:
+      case UV_EEXIST:
+      case UV_EPERM: {
+        // if we're here, then we couldn't rmdir `path`, typically because
+        // it's full of stuff.  We'll push it back on our stack of paths to
+        // contend with later.
+        std::string path = req->path;
+        req_wrap->continuation_data->PushPath(std::move(path));
+        uv_fs_req_cleanup(req);
+        uv_fs_scandir(loop,
+                      req,
+                      path.c_str(),
+                      0,
+                      uv_fs_callback_t{[](uv_fs_t* req) {
+          FSReqBase* req_wrap = FSReqBase::from_req(req);
+          std::string path = req->path;
+          int scandir_rc = req->result;
+          if (scandir_rc <= 0) {
+            req_wrap->continuation_data->Done(scandir_rc);
+            return;
+          }
+          while (true) {
+            uv_dirent_t ent;
+            std::string next_path;
+            int scandir_next_rc = uv_fs_scandir_next(req, &ent);
+            switch (scandir_next_rc) {
+              case UV_EOF:
+                return;
+              case 0:
+                next_path = path + std::string(kPathSeparator) + ent.name;
+                req_wrap->continuation_data->PushPath(std::move(next_path));
+                break;
+              default:
+                req_wrap->continuation_data->Done(scandir_next_rc);
+                return;
+            }
+          }
+        }});
+      }
+      default: {
+        req_wrap->continuation_data->Done(rmdir_rc);
+      }
+    }
+  }});
+}
+
+int IsDir(uv_fs_t* req) {
+  const uv_stat_t* const s = static_cast<uv_stat_t*>(req->ptr);
+  return !!(s->st_mode & S_IFDIR);
 }
 
 int RMDirForceSync(uv_loop_t* loop, uv_fs_t* req, const std::string& path,
@@ -1288,8 +1368,8 @@ int RMDirForceSync(uv_loop_t* loop, uv_fs_t* req, const std::string& path,
   continuation_data.PushPath(std::move(path));
 
   while (continuation_data.paths.size() > 0) {
-    std::string next_path = continuation_data.PopPath();
-    int lstat_rc = uv_fs_lstat(loop, req, next_path.c_str(), nullptr);
+    std::string path = continuation_data.PopPath();
+    int lstat_rc = uv_fs_lstat(loop, req, path.c_str(), nullptr);
     switch (lstat_rc) {
       case UV_ENOENT: {
         // since this is a "force" operation, we don't care if
@@ -1297,25 +1377,27 @@ int RMDirForceSync(uv_loop_t* loop, uv_fs_t* req, const std::string& path,
         break;
       }
       case 0: {
-        const uv_stat_t* const s = static_cast<const uv_stat_t*>(req->ptr);
-        int is_dir = !!(s->st_mode & S_IFDIR);
+        int is_dir = IsDir(req);
+        uv_fs_req_cleanup(req);
         int rmdir_rc = 0;
         if (is_dir == 1) {
-          rmdir_rc = RMDirForceSyncDir(
-              loop, req, std::move(next_path), &continuation_data, lstat_rc);
+          continuation_data.last_rc = lstat_rc;
+          rmdir_rc = RMDirForceSyncDir(loop,
+                                       req,
+                                       std::move(path),
+                                       &continuation_data);
         } else {
-          int unlink_rc = uv_fs_unlink(loop, req, next_path.c_str(), nullptr);
+          int unlink_rc = uv_fs_unlink(loop, req, path.c_str(), nullptr);
           switch (unlink_rc) {
             case 0:
             case UV_ENOENT:
               break;
             case UV_EISDIR:
             case UV_EPERM:
-              rmdir_rc = RMDirForceSyncDir(loop,
-                                           req,
-                                           std::move(next_path),
-                                           &continuation_data,
-                                           unlink_rc);
+              uv_fs_req_cleanup(req);
+              continuation_data.last_rc = unlink_rc;
+              rmdir_rc = RMDirForceSyncDir(
+                  loop, req, std::move(path), &continuation_data);
             default:
               return unlink_rc;
           }
@@ -1350,18 +1432,72 @@ int RMDirForceAsync(uv_loop_t* loop,
   }
 
   std::string next_path = req_wrap->continuation_data->PopPath();
-  int lstat_rc = uv_fs_lstat(loop, req, next_path.c_str(), uv_fs_callback_t{[](uv_fs_t* req) {
+  return uv_fs_lstat(loop,
+                     req,
+                     next_path.c_str(),
+                     uv_fs_callback_t{[](uv_fs_t* req) {
     FSReqBase* req_wrap = FSReqBase::from_req(req);
     Environment* env = req_wrap->env();
     uv_loop_t* loop = env->event_loop();
     std::string path = req->path;
     int lstat_rc = req->result;
 
-    switch(lstat_rc) {
-
+    switch (lstat_rc) {
+      case UV_ENOENT: {
+        // since this is a "force" operation, we don't care if
+        // the path doesn't exist. we're done.
+        if (req_wrap->continuation_data->paths.size() == 0) {
+          req_wrap->continuation_data->Done(0);
+        } else {
+          uv_fs_req_cleanup(req);
+          RMDirForceAsync(loop, req, path.c_str(), nullptr);
+        }
+        break;
+      }
+      case 0: {
+        int is_dir = IsDir(req);
+        uv_fs_req_cleanup(req);
+        if (is_dir == 1) {
+          req_wrap->continuation_data->last_rc = lstat_rc;
+          RMDirForceAsyncDir(loop, req, std::move(path));
+        } else {
+          uv_fs_unlink(loop,
+          req,
+          path.c_str(),
+          uv_fs_callback_t{[](uv_fs_t* req) {
+            int unlink_rc = req->result;
+            std::string path = req->path;
+            FSReqBase* req_wrap = FSReqBase::from_req(req);
+            switch (unlink_rc) {
+              case 0:
+              case UV_ENOENT: {
+                req_wrap->continuation_data->Done(0);
+                break;
+              }
+              case UV_EISDIR:
+              case UV_EPERM: {
+                uv_fs_req_cleanup(req);
+                req_wrap->continuation_data->last_rc = unlink_rc;
+                RMDirForceAsyncDir(req_wrap->env()->event_loop(),
+                                   req,
+                                   std::move(path));
+                break;
+              }
+              default:
+                req_wrap->continuation_data->Done(unlink_rc);
+            }
+          }});
+        }
+      }
+      case UV_EPERM: {
+        // Windows can EPERM on lstat; we could try to chmod the path into
+        // capitulation, as rimraf does.
+      }
+      default: {
+        req_wrap->continuation_data->Done(lstat_rc);
+      }
     }
   }});
-
 }
 
 static void RMDir(const FunctionCallbackInfo<Value>& args) {
@@ -1374,23 +1510,23 @@ static void RMDir(const FunctionCallbackInfo<Value>& args) {
   CHECK_NOT_NULL(*path);
 
   CHECK(args[1]->IsBoolean());
-  bool force = args[1]->IsTrue();
+  bool recursive = args[1]->IsTrue();
 
-  FSReqBase* req_wrap_async = GetReqWrap(env, args[1]);
+  FSReqBase* req_wrap_async = GetReqWrap(env, args[2]);
   if (req_wrap_async != nullptr) {
-    // rmdir(path, force, req)
+    // rmdir(path, recursive, req)
     AsyncCall(env, req_wrap_async, args, "rmdir", UTF8, AfterNoArgs,
-              force ? RMDirForceAsync : uv_fs_rmdir, *path);
+              recursive ? RMDirForceAsync : uv_fs_rmdir, *path);
   } else {
-    // rmdir(path, force, undefined, ctx)
+    // rmdir(path, recursive, undefined, ctx)
     CHECK_EQ(argc, 4);
     FSReqWrapSync req_wrap_sync;
     FS_SYNC_TRACE_BEGIN(rmdir);
-    if (force) {
-      SyncCall(env, args[2], &req_wrap_sync, "rmdir",
+    if (recursive) {
+      SyncCall(env, args[3], &req_wrap_sync, "rmdir",
                RMDirForceSync, *path);
     } else {
-      SyncCall(env, args[2], &req_wrap_sync, "rmdir",
+      SyncCall(env, args[3], &req_wrap_sync, "rmdir",
                uv_fs_rmdir, *path);
     }
     FS_SYNC_TRACE_END(rmdir);
