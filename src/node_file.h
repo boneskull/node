@@ -35,6 +35,7 @@ class FSContinuationData : public MemoryRetainer {
   int mode;
   std::vector<std::string> paths{};
   int last_rc;
+  std::string last_path;
 
   void PushPath(std::string&& path) {
     paths.emplace_back(std::move(path));
@@ -47,6 +48,7 @@ class FSContinuationData : public MemoryRetainer {
   std::string PopPath() {
     CHECK_GT(paths.size(), 0);
     std::string path = std::move(paths.back());
+    last_path = path;
     paths.pop_back();
     return path;
   }
