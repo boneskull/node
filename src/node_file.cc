@@ -1287,19 +1287,28 @@ int RMDirRecursiveSyncDir(uv_loop_t* loop,
   }
 }
 
-int RMDirRecursiveAsyncDir(uv_loop_t* loop, uv_fs_t* req, const std::string& path) {
+
+int RMDirRecursiveAsync(uv_loop_t* loop,
+                    uv_fs_t* req,
+                    const char* path = nullptr,
+                    uv_fs_cb cb = nullptr);
+int RMDirRecursiveAsyncDir(uv_loop_t* loop, uv_fs_t* req, const char * path) {
   return uv_fs_rmdir(
-      loop, req, path.c_str(), uv_fs_callback_t{[](uv_fs_t* req) {
+      loop, req, path, uv_fs_callback_t{[](uv_fs_t* req) {
         FSReqBase* req_wrap = FSReqBase::from_req(req);
         uv_loop_t* loop = req->loop;
         std::string path = req->path;
         int rmdir_rc = req->result;
         switch (rmdir_rc) {
           case 0: {
+            // we successfully removed dir with path `path`.
+            // if this was the last path we needed to work with, we're done;
+            // otherwise, clean up the request and continue.
             if (req_wrap->continuation_data->paths.size() == 0) {
               req_wrap->continuation_data->Done(0);
             } else {
               uv_fs_req_cleanup(req);
+              RMDirRecursiveAsync(loop, req);
             }
             return;
           }
@@ -1314,12 +1323,13 @@ int RMDirRecursiveAsyncDir(uv_loop_t* loop, uv_fs_t* req, const std::string& pat
             // if we're here, then we couldn't rmdir `path`, typically because
             // it's full of stuff.  We'll push it back on our stack of paths to
             // contend with later.
-            req_wrap->continuation_data->PushPath(std::move(path));
             uv_fs_req_cleanup(req);
+            req_wrap->continuation_data->PushPath(path);
             uv_fs_scandir(
                 loop, req, path.c_str(), 0, uv_fs_callback_t{[](uv_fs_t* req) {
                   FSReqBase* req_wrap = FSReqBase::from_req(req);
                   std::string path = req->path;
+                  uv_loop_t* loop = req->loop;
                   int scandir_rc = req->result;
                   if (scandir_rc <= 0) {
                     req_wrap->continuation_data->Done(scandir_rc);
@@ -1331,6 +1341,7 @@ int RMDirRecursiveAsyncDir(uv_loop_t* loop, uv_fs_t* req, const std::string& pat
                     int scandir_next_rc = uv_fs_scandir_next(req, &ent);
                     switch (scandir_next_rc) {
                       case UV_EOF:
+                        RMDirRecursiveAsync(loop, req);
                         return;
                       case 0:
                         next_path =
@@ -1344,6 +1355,7 @@ int RMDirRecursiveAsyncDir(uv_loop_t* loop, uv_fs_t* req, const std::string& pat
                     }
                   }
                 }});
+            break;
           }
           default: { req_wrap->continuation_data->Done(rmdir_rc); }
         }
@@ -1428,7 +1440,7 @@ int RMDirRecursiveAsync(uv_loop_t* loop,
         FSReqBase* req_wrap = FSReqBase::from_req(req);
         Environment* env = req_wrap->env();
         uv_loop_t* loop = env->event_loop();
-        std::string path = req_wrap->continuation_data->last_path;
+        std::string path = req->path;
         int lstat_rc = req->result;
 
         switch (lstat_rc) {
@@ -1439,7 +1451,7 @@ int RMDirRecursiveAsync(uv_loop_t* loop,
               req_wrap->continuation_data->Done(0);
             } else {
               uv_fs_req_cleanup(req);
-              RMDirRecursiveAsync(loop, req, path.c_str(), nullptr);
+              RMDirRecursiveAsync(loop, req);
             }
             break;
           }
@@ -1448,17 +1460,19 @@ int RMDirRecursiveAsync(uv_loop_t* loop,
             uv_fs_req_cleanup(req);
             if (is_dir == 1) {
               req_wrap->continuation_data->last_rc = lstat_rc;
-              RMDirRecursiveAsyncDir(loop, req, path);
+              RMDirRecursiveAsyncDir(loop, req, path.c_str());
             } else {
               uv_fs_unlink(
                   loop, req, path.c_str(), uv_fs_callback_t{[](uv_fs_t* req) {
                     int unlink_rc = req->result;
                     std::string path = req->path;
                     FSReqBase* req_wrap = FSReqBase::from_req(req);
+                    Environment* env = req_wrap->env();
+                    uv_loop_t* loop = env->event_loop();
                     switch (unlink_rc) {
                       case 0:
                       case UV_ENOENT: {
-                        req_wrap->continuation_data->Done(0);
+                        RMDirRecursiveAsync(loop, req);
                         break;
                       }
                       case UV_EISDIR:
@@ -1467,16 +1481,15 @@ int RMDirRecursiveAsync(uv_loop_t* loop,
                         req_wrap->continuation_data->last_rc = unlink_rc;
                         RMDirRecursiveAsyncDir(req_wrap->env()->event_loop(),
                                                req,
-                                               path);
+                                               path.c_str());
                         break;
                       }
-                      case UV_ENOTEMPTY:
-                        1;
                       default:
                         req_wrap->continuation_data->Done(unlink_rc);
                     }
                   }});
             }
+            break;
           }
           case UV_EPERM: {
             // Windows can EPERM on lstat; we could try to chmod the path into

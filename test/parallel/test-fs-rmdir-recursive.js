@@ -7,25 +7,33 @@ const fs = require('fs');
 const tmpdir = require('../common/tmpdir');
 const basedirpath = path.join(tmpdir.path, 'dir');
 const subdirpath = path.join(basedirpath, 'subdir');
+const filepath = path.join(subdirpath, 'foo.txt');
+
+function createTree() {
+  // Create the directory and file hierarchy
+  fs.mkdirSync(subdirpath, { recursive: true });
+  fs.writeFileSync(filepath, 'bar\n');
+  // Make sure the file exists
+  assert(fs.existsSync(filepath));
+}
 
 tmpdir.refresh();
-
-// Make sure the directory does not exist
+// sanity check
 assert(!fs.existsSync(basedirpath));
-// Create the directory now
-fs.mkdirSync(subdirpath, { recursive: true });
-// Make sure the directory exists
-assert(fs.existsSync(subdirpath));
+createTree();
+
 // remove the base
 fs.rmdirSync(basedirpath, { recursive: true });
-// Make sure the directory does not exist
+// ensure nothing exists
+assert(!fs.existsSync(filepath));
+assert(!fs.existsSync(subdirpath));
 assert(!fs.existsSync(basedirpath));
 
 // Similarly test the Async version
-fs.mkdir(subdirpath, { recursive: true },
-         common.mustCall(function(err) {
-           assert.ifError(err);
-           assert.strictEqual(this, undefined);
-           fs.rmdir(basedirpath, { recursive: true },
-                    assert.ifError);
-         }));
+createTree();
+fs.rmdir(basedirpath, { recursive: true }, common.mustCall((err) => {
+  assert.ifError(err);
+  assert(!fs.existsSync(filepath));
+  assert(!fs.existsSync(subdirpath));
+  assert(!fs.existsSync(basedirpath));
+}));
