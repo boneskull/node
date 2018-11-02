@@ -1472,6 +1472,7 @@ int RMDirRecursiveAsync(uv_loop_t* loop,
                     switch (unlink_rc) {
                       case 0:
                       case UV_ENOENT: {
+                        uv_fs_req_cleanup(req);
                         RMDirRecursiveAsync(loop, req);
                         break;
                       }
